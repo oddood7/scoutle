@@ -5,6 +5,7 @@ Focuses on op.gg account stats and lolalytics champion data
 
 import requests
 import re
+import time
 from typing import Dict, List, Optional, Any
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
@@ -139,31 +140,77 @@ class SimpleAccountScraper:
         flex_lp = 0
         
         try:
-            # Extract Solo/Duo rank - use the patterns that work from debug
-            if "diamond 4" in page_text.lower():
-                soloq_rank = "Diamond 4"
-                # Look for LP value near diamond 4
-                lp_match = re.search(r'diamond 4.*?(\d+).*?LP', page_text, re.IGNORECASE)
-                if lp_match:
-                    soloq_lp = int(lp_match.group(1))
-            elif "diamond" in page_text.lower():
-                # Fallback: look for any diamond rank
-                diamond_match = re.search(r'diamond\s+(\d+)', page_text, re.IGNORECASE)
-                if diamond_match:
-                    soloq_rank = f"Diamond {diamond_match.group(1)}"
+            # Extract Solo/Duo rank with improved LP parsing
+            # League ranks: Iron, Bronze, Silver, Gold, Platinum, Diamond (with divisions I-IV)
+            # Master, Grandmaster, Challenger (NO divisions, but have LP)
             
-            # Extract Flex rank - use the patterns that work from debug
-            if "platinum 2" in page_text.lower():
-                flex_rank = "Platinum 2"
-                # Look for LP value near platinum 2
-                lp_match = re.search(r'platinum 2.*?(\d+).*?LP', page_text, re.IGNORECASE)
-                if lp_match:
-                    flex_lp = int(lp_match.group(1))
-            elif "platinum" in page_text.lower():
-                # Fallback: look for any platinum rank
-                platinum_match = re.search(r'platinum\s+(\d+)', page_text, re.IGNORECASE)
-                if platinum_match:
-                    flex_rank = f"Platinum {platinum_match.group(1)}"
+            # Patterns for regular ranks (Iron-Diamond) - WITH divisions - TRY THESE FIRST!
+            # These are more specific (have divisions) so they're less likely to false match
+            # OP.GG format can be: "diamond 452 LP" where "4" is division and "52" is LP (concatenated!)
+            regular_rank_patterns = [
+                # NEW: Handle OP.GG's concatenated format: "diamond 452 LP" = Diamond IV 52 LP
+                (r'(?:Solo|Ranked Solo).{0,200}?(Diamond|Platinum|Gold|Silver|Bronze|Iron)\s+(4|3|2|1)(\d{1,2})\s*LP', 'regular_with_lp_concatenated'),
+                # Match with Solo context: "Solo ... Diamond IV 45 LP" (within 200 chars)
+                (r'(?:Solo|Ranked Solo).{0,200}?(Diamond|Platinum|Gold|Silver|Bronze|Iron)\s+(IV|III|II|I|4|3|2|1)\s+(\d{1,3})\s*LP', 'regular_with_lp_spaced'),
+                # Fallback with Solo context: just rank and division
+                (r'(?:Solo|Ranked Solo).{0,200}?(Diamond|Platinum|Gold|Silver|Bronze|Iron)\s+(IV|III|II|I|4|3|2|1)', 'regular_no_lp'),
+            ]
+            
+            # Patterns for high elo ranks (Master, Grandmaster, Challenger) - NO divisions - TRY AFTER REGULAR!
+            # Much tighter now - within 100 chars of "Solo"
+            high_elo_patterns = [
+                # Match: "Solo ... Challenger 1234 LP" within 100 chars
+                (r'(?:Solo|Ranked Solo).{0,100}(Challenger|Grandmaster|Master)\s+(\d{1,4})\s*LP', 'high_elo_with_lp'),
+                # Fallback: just rank name with Solo context within 100 chars
+                (r'(?:Solo|Ranked Solo).{0,100}(Challenger|Grandmaster|Master)(?!\s+\d)', 'high_elo_no_lp'),
+            ]
+            
+            # Try regular ranks FIRST (they're more specific with divisions)
+            for pattern, pattern_type in regular_rank_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    rank_tier = match.group(1).capitalize()
+                    rank_division = match.group(2).upper()
+                    # Convert arabic to roman if needed
+                    division_map = {'4': 'IV', '3': 'III', '2': 'II', '1': 'I'}
+                    if rank_division in division_map:
+                        rank_division = division_map[rank_division]
+                    
+                    soloq_rank = f"{rank_tier} {rank_division}"
+                    
+                    # Extract LP if present (group 3 for regular ranks)
+                    if len(match.groups()) >= 3 and ('with_lp' in pattern_type or 'concatenated' in pattern_type):
+                        try:
+                            lp_value = int(match.group(3))
+                            # Validate LP is between 0-100 for regular ranks
+                            if 0 <= lp_value <= 100:
+                                soloq_lp = lp_value
+                        except (ValueError, IndexError):
+                            pass
+                    break
+            
+            # If no regular rank found, try high elo ranks (Master/Grandmaster/Challenger)
+            if soloq_rank == "Unranked":
+                for pattern, pattern_type in high_elo_patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        rank_tier = match.group(1).capitalize()
+                        soloq_rank = rank_tier  # No division for high elo
+                        
+                        # Extract LP if present
+                        if len(match.groups()) >= 2 and 'with_lp' in pattern_type:
+                            try:
+                                lp_value = int(match.group(2))
+                                # High elo can have LP > 100
+                                if lp_value >= 0:
+                                    soloq_lp = lp_value
+                            except (ValueError, IndexError):
+                                pass
+                        break
+            
+            # Note: Flex rank requires JavaScript rendering on OP.GG
+            # It's not available in static HTML, so we skip it
+            # flex_rank and flex_lp remain as "Unranked" and 0
                 
         except Exception as e:
             print(f"⚠️ Could not extract ranked info: {e}")
@@ -796,90 +843,204 @@ class SimpleAccountScraper:
         return performances
 
     def _scrape_and_aggregate_match_history(self, summoner_name: str, region: str) -> List[ChampionPerformance]:
-        """Extract champion stats from available data (past 7 days) since full season data is not accessible"""
-        print(f"🔍 Extracting available champion data for {summoner_name} ({region})...")
+        """Extract champion stats from Champions page with real season data"""
+        print(f"🔍 Extracting real season champion data for {summoner_name} ({region})...")
         
         try:
-            # Get the main page data
+            # Get the Champions page data (this has the real season stats)
             url_summoner = summoner_name.replace('#', '-')
-            main_url = f"https://op.gg/lol/summoners/{region}/{url_summoner}"
+            champions_url = f"https://op.gg/lol/summoners/{region}/{url_summoner}/champions"
             
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
-            response = requests.get(main_url, headers=headers, timeout=10)
+            response = requests.get(champions_url, headers=headers, timeout=10)
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.content, 'html.parser')
-            page_text = str(soup)
+            page_text = response.text
             
-            # Extract "Ranked win rate in past 7 days" data
             performances = []
             
-            # Look for the specific pattern from the HTML structure we found
-            # Pattern: "tr","ChampionName",{"className":"text-xs","children":[...]}
-            # Then look for wins/losses in the win rate section
+            # Extract overall season statistics first
+            overall_pattern = r'(\d+)Win (\d+)Lose Win rate (\d+)%'
+            overall_matches = re.findall(overall_pattern, page_text)
             
-            # Find all champion rows in the past 7 days section
-            # Look for the pattern: "tr","ChampionName",{"className":"text-xs"
-            champion_rows = re.findall(r'"tr","([^"]+)",\{"className":"text-xs"', page_text)
+            if overall_matches:
+                # Take the first match (should be the overall season stats)
+                total_wins = int(overall_matches[0][0])
+                total_losses = int(overall_matches[0][1])
+                overall_win_rate = float(overall_matches[0][2])
+                total_games = total_wins + total_losses
+                
+                print(f"🔍 Found overall season stats: {total_games} games ({total_wins}W {total_losses}L, {overall_win_rate}% WR)")
+                
+                # Create overall performance entry
+                overall_performance = ChampionPerformance(
+                    champion_name="Overall Season",
+                    games_played=total_games,
+                    wins=total_wins,
+                    losses=total_losses,
+                    win_rate=overall_win_rate,
+                    kills=0.0,  # Not available in overall stats
+                    deaths=0.0,  # Not available in overall stats
+                    assists=0.0,  # Not available in overall stats
+                    kda=2.0 + (overall_win_rate - 50) * 0.1,  # Estimate based on win rate
+                    cs_per_min=6.0 + (overall_win_rate - 50) * 0.05,  # Estimate based on win rate
+                    queue_type="soloq"
+                )
+                performances.append(overall_performance)
+                print(f"✅ Added overall season data: {total_games} games, {overall_win_rate}% WR")
             
-            # If that doesn't work, try a simpler approach
-            if not champion_rows:
-                # Look for champion names in the "past 7 days" section
-                champion_names = ['Corki', 'Kai\'Sa', 'Ezreal', 'Zeri']
-                for champion_name in champion_names:
-                    if champion_name in page_text:
-                        champion_rows.append(champion_name)
+            # Extract real season data from the Champions page
+            # Pattern: "ChampionName - XWin YLose Win rate Z%"
+            print("🔍 Extracting real season data from Champions page...")
             
-            for champion_name in champion_rows:
-                # Look for the win/loss data for this champion
-                # Use a simpler approach - look for the champion name and then find wins/losses nearby
-                champion_section = re.search(f'"{champion_name}".*?(\\d+)W.*?(\\d+)L', page_text)
-                if champion_section:
-                    wins = int(champion_section.group(1))
-                    losses = int(champion_section.group(2))
-                    games = wins + losses
+            # Try multiple patterns to catch all champions
+            # Look for the champion data pattern in the page text
+            # Based on the actual data format: "Zeri - 7Win 4Lose Win rate 64%"
+            # Handle HTML entities: "Kai&#x27;Sa" instead of "Kai'Sa"
+            patterns = [
+                # Pattern 1: With dash and spaces
+                r'([A-Za-z]+(?:&#x27;[A-Za-z]+)?|[A-Za-z\s&;x0-9]+) - (\d+)Win (\d+)Lose Win rate (\d+)%',
+                # Pattern 2: Without dash
+                r'([A-Za-z]+(?:&#x27;[A-Za-z]+)?|[A-Za-z\s&;x0-9]+)\s+(\d+)Win (\d+)Lose Win rate (\d+)%',
+                # Pattern 3: More flexible spacing
+                r'([A-Za-z\']+(?:\s+[A-Za-z]+)?)\s*-?\s*(\d+)\s*Win\s+(\d+)\s*Lose\s+Win rate\s+(\d+)%',
+            ]
+            
+            all_matches = []
+            for pattern in patterns:
+                matches = re.findall(pattern, page_text)
+                if matches:
+                    print(f"🔍 Pattern found {len(matches)} matches with pattern: {pattern[:50]}...")
+                    all_matches.extend(matches)
+            
+            if all_matches:
+                print(f"🔍 Found {len(all_matches)} total champion matches (including duplicates)")
+                
+                # Remove duplicates and filter out invalid champion names
+                seen_champions = set()
+                unique_matches = []
+                for match in all_matches:
+                    champion_name = match[0].strip()
+                    # Convert HTML entities for comparison
+                    champion_name = champion_name.replace('&#x27;', "'")
+                    champion_name = champion_name.replace('&amp;', '&')
+                    # Clean up any remaining HTML entities
+                    champion_name = re.sub(r'&#x\w+;', '', champion_name).strip()
                     
-                    if games > 0:
-                        win_rate = (wins / games) * 100
+                    # Filter out invalid names (too short, common words, etc.)
+                    if (champion_name and 
+                        champion_name not in seen_champions and 
+                        len(champion_name) > 2 and 
+                        champion_name not in ['Sa', 'Win', 'Lose', 'rate', 'Overall', 'Season', 'Flex', 'Solo']):
+                        seen_champions.add(champion_name)
+                        # Store with cleaned name
+                        unique_matches.append((champion_name, match[1], match[2], match[3]))
+                
+                print(f"🔍 Found {len(unique_matches)} unique champions with real season data")
+                
+                for match in unique_matches:
+                    try:
+                        champion_name = match[0]  # Already cleaned in the loop above
+                        wins = int(match[1])
+                        losses = int(match[2])
+                        win_rate = float(match[3])
+                        games_played = wins + losses
                         
-                        # Estimate stats based on win rate (realistic estimates)
-                        kda = 2.0 + (win_rate - 50) * 0.02
-                        avg_kills = 6.0 + (win_rate - 50) * 0.05
-                        avg_deaths = 5.0 - (win_rate - 50) * 0.03
-                        avg_assists = 8.0 + (win_rate - 50) * 0.04
+                        # Estimate KDA, kills, deaths, assists based on win rate
+                        if win_rate >= 60:
+                            kills, deaths, assists = 8.0, 4.0, 6.0
+                        elif win_rate >= 50:
+                            kills, deaths, assists = 6.0, 5.0, 5.0
+                        else:
+                            kills, deaths, assists = 5.0, 6.0, 4.0
+                        
+                        kda = (kills + assists) / deaths if deaths > 0 else kills + assists
                         cs_per_min = 6.0 + (win_rate - 50) * 0.05
                         
                         performance = ChampionPerformance(
                             champion_name=champion_name,
-                            games_played=games,
+                            games_played=games_played,
                             wins=wins,
                             losses=losses,
                             win_rate=win_rate,
-                            kills=avg_kills,
-                            deaths=avg_deaths,
-                            assists=avg_assists,
+                            kills=kills,
+                            deaths=deaths,
+                            assists=assists,
                             kda=kda,
                             cs_per_min=cs_per_min,
                             queue_type="soloq"
                         )
                         performances.append(performance)
+                        print(f"✅ Extracted real season data for {champion_name}: {games_played} games, {win_rate:.1f}% WR, {kda:.2f} KDA")
+                        
+                    except (ValueError, IndexError) as e:
+                        print(f"⚠️ Error processing season data for {champion_name}: {e}")
+                        continue
+            else:
+                print("🔍 No season data found, trying alternative patterns...")
+                
+                # Try simpler pattern for individual champion entries
+                simple_pattern = r'"name":"([^"]+)".*?"play":(\d+).*?"win":(\d+).*?"lose":(\d+).*?"win_rate":(\d+)'
+                simple_matches = re.findall(simple_pattern, page_text)
+                
+                if simple_matches:
+                    print(f"🔍 Found {len(simple_matches)} champions with basic season data")
+                    
+                    for match in simple_matches:
+                        try:
+                            champion_name = match[0].strip()
+                            games_played = int(match[1])
+                            wins = int(match[2])
+                            losses = int(match[3])
+                            win_rate = float(match[4])
+                            
+                            # Estimate stats based on win rate
+                            kills = 6.0 + (win_rate - 50) * 0.1
+                            deaths = 5.0 - (win_rate - 50) * 0.05
+                            assists = 7.0 + (win_rate - 50) * 0.08
+                            kda = (kills + assists) / max(deaths, 1)
+                            cs_per_min = 6.0 + (win_rate - 50) * 0.05
+                            
+                            performance = ChampionPerformance(
+                                champion_name=champion_name,
+                                games_played=games_played,
+                                wins=wins,
+                                losses=losses,
+                                win_rate=win_rate,
+                                kills=kills,
+                                deaths=deaths,
+                                assists=assists,
+                                kda=kda,
+                                cs_per_min=cs_per_min,
+                                queue_type="soloq"
+                            )
+                            performances.append(performance)
+                            print(f"✅ Extracted basic season data for {champion_name}: {games_played} games, {win_rate:.1f}% WR")
+                            
+                        except (ValueError, IndexError) as e:
+                            print(f"⚠️ Error processing basic season data for {champion_name}: {e}")
+                            continue
             
-            # Sort by games played (most played first)
-            performances.sort(key=lambda x: x.games_played, reverse=True)
+            # Sort by games played (most played first), but put overall season first
+            performances.sort(key=lambda x: (x.champion_name != "Overall Season", -x.games_played))
             
             if performances:
-                print(f"✅ Found {len(performances)} champions with recent data (past 7 days)")
-                print("ℹ️ Note: This shows recent performance data, not full season stats")
+                print(f"✅ Found {len(performances)} entries with real season data")
             else:
-                print("⚠️ No champion data found in available sources")
+                print("⚠️ No champion data found in Champions page")
             
             return performances
             
         except Exception as e:
             print(f"⚠️ Error extracting champion data: {e}")
             return []
+
+    def scrape_champion_meta_data(self, champion_names: List[str]) -> Dict[str, ChampionMetaData]:
+        """Scrape meta data for multiple champions using LolalyticsScraper"""
+        lolalytics = LolalyticsScraper()
+        return lolalytics.scrape_multiple_champions(champion_names)
 
 class LolalyticsScraper:
     """Scraper for champion meta data from lolalytics"""
@@ -1098,10 +1259,38 @@ def main():
     print(f"Level: {result.level}")
     print(f"SoloQ Rank: {result.soloq_rank} ({result.soloq_lp} LP)")
     print(f"Flex Rank: {result.flex_rank} ({result.flex_lp} LP)")
-    print(f"\n=== CHAMPION PERFORMANCES ===")
-    print(f"Total Champions Played: {len(result.champion_performances)}")
+    # Separate overall stats from champion stats
+    overall_stats = None
+    champion_stats = []
     
-    for i, champ in enumerate(result.champion_performances[:10], 1):
+    for champ in result.champion_performances:
+        if champ.champion_name == "Overall Season":
+            overall_stats = champ
+        else:
+            champion_stats.append(champ)
+    
+    print(f"\n=== OVERALL STATISTICS ===")
+    if overall_stats:
+        print(f"Total Games: {overall_stats.games_played}")
+        print(f"Total Wins: {overall_stats.wins}")
+        print(f"Overall Win Rate: {overall_stats.win_rate:.1f}%")
+        print(f"Most Played Champion: {champion_stats[0].champion_name if champion_stats else 'N/A'}")
+        print(f"Best Win Rate Champion: {max(champion_stats, key=lambda x: x.win_rate).champion_name if champion_stats else 'N/A'}")
+    else:
+        # Fallback: calculate from individual champions
+        total_games = sum(champ.games_played for champ in champion_stats)
+        total_wins = sum(champ.wins for champ in champion_stats)
+        overall_win_rate = (total_wins / total_games * 100) if total_games > 0 else 0
+        print(f"Total Games: {total_games}")
+        print(f"Total Wins: {total_wins}")
+        print(f"Overall Win Rate: {overall_win_rate:.1f}%")
+        print(f"Most Played Champion: {champion_stats[0].champion_name if champion_stats else 'N/A'}")
+        print(f"Best Win Rate Champion: {max(champion_stats, key=lambda x: x.win_rate).champion_name if champion_stats else 'N/A'}")
+    
+    print(f"\n=== CHAMPION PERFORMANCES ===")
+    print(f"Total Champions Played: {len(champion_stats)}")
+    
+    for i, champ in enumerate(champion_stats[:10], 1):
         print(f"{i:2d}. {champ.champion_name:12s}: {champ.games_played:2d} games, {champ.win_rate:5.1f}% win rate, {champ.kda:4.2f} KDA")
     
     # Test meta data

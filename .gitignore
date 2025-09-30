@@ -119,3 +119,6 @@ Thumbs.db
 *.log
 temp/
 tmp/
+config.json
+manual_matches.json
+debug*.html
