@@ -1,3 +1,4 @@
+
 """
 Riot Games API Scraper for League of Legends
 Provides comprehensive champion statistics using the official Riot Games API
@@ -64,40 +65,79 @@ class RiotApiScraper:
                 'X-Riot-Token': self.api_key,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
+        self.last_request_time = 0
+        self.request_delay = 0.05  # 50ms delay between requests (20 req/sec max)
     
-    def get_summoner_by_name(self, summoner_name: str, region: str = "euw") -> Optional[Dict]:
-        """Get summoner information by name"""
+    def get_summoner_by_riot_id(self, game_name: str, tag_line: str, region: str = "euw") -> Optional[Dict]:
+        """Get summoner information by Riot ID (gameName#tagLine)"""
         if not self.api_key:
             print("❌ API key required for Riot API access")
             return None
         
         try:
-            url = f"{self.base_urls[region]}/lol/summoner/v4/summoners/by-name/{summoner_name}"
-            response = self.session.get(url, timeout=10)
+            # Map region to routing value for account-v1
+            routing_regions = {
+                'euw': 'europe', 'na': 'americas', 'kr': 'asia',
+                'eune': 'europe', 'br': 'americas', 'jp': 'asia',
+                'ru': 'europe', 'oce': 'sea', 'tr': 'europe',
+                'lan': 'americas', 'las': 'americas'
+            }
             
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 404:
-                print(f"❌ Summoner not found: {summoner_name}")
+            routing_region = routing_regions.get(region, 'europe')
+            
+            # Step 1: Get account by Riot ID
+            account_url = f"https://{routing_region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
+            account_response = self.session.get(account_url, timeout=10)
+            
+            if account_response.status_code != 200:
+                if account_response.status_code == 404:
+                    print(f"❌ Riot ID not found: {game_name}#{tag_line}")
+                elif account_response.status_code == 403:
+                    print("❌ API key forbidden - check your key permissions")
+                else:
+                    print(f"❌ API error: {account_response.status_code}")
                 return None
-            elif response.status_code == 403:
-                print("❌ Invalid API key")
-                return None
+            
+            account_data = account_response.json()
+            puuid = account_data['puuid']
+            
+            # Step 2: Get summoner by PUUID
+            summoner_url = f"{self.base_urls[region]}/lol/summoner/v4/summoners/by-puuid/{puuid}"
+            summoner_response = self.session.get(summoner_url, timeout=10)
+            
+            if summoner_response.status_code == 200:
+                summoner_data = summoner_response.json()
+                summoner_data['riotId'] = f"{game_name}#{tag_line}"
+                summoner_data['name'] = f"{game_name}#{tag_line}"  # Add name field for compatibility
+                summoner_data['gameName'] = game_name
+                summoner_data['tagLine'] = tag_line
+                return summoner_data
             else:
-                print(f"❌ API error: {response.status_code}")
+                print(f"❌ Could not fetch summoner data: {summoner_response.status_code}")
                 return None
                 
         except Exception as e:
             print(f"❌ Error getting summoner: {e}")
             return None
     
-    def get_summoner_ranked_info(self, summoner_id: str, region: str = "euw") -> Dict:
-        """Get summoner's ranked information"""
+    def get_summoner_by_name(self, summoner_name: str, region: str = "euw") -> Optional[Dict]:
+        """Get summoner information by name (legacy support, tries to parse as Riot ID)"""
+        # If it contains #, treat as Riot ID
+        if '#' in summoner_name:
+            parts = summoner_name.split('#', 1)
+            return self.get_summoner_by_riot_id(parts[0], parts[1], region)
+        else:
+            # Try to use it as game name with common tag
+            print(f"⚠️ No tag provided, trying {summoner_name}#EUW")
+            return self.get_summoner_by_riot_id(summoner_name, region.upper(), region)
+    
+    def get_summoner_ranked_info(self, puuid: str, region: str = "euw") -> Dict:
+        """Get summoner's ranked information using PUUID"""
         if not self.api_key:
             return {"soloq_rank": "API Key Required", "flex_rank": "API Key Required"}
         
         try:
-            url = f"{self.base_urls[region]}/lol/league/v4/entries/by-summoner/{summoner_id}"
+            url = f"{self.base_urls[region]}/lol/league/v4/entries/by-puuid/{puuid}"
             response = self.session.get(url, timeout=10)
             
             if response.status_code == 200:
@@ -120,13 +160,13 @@ class RiotApiScraper:
             print(f"❌ Error getting ranked info: {e}")
             return {"soloq_rank": "Unranked", "flex_rank": "Unranked", "soloq_lp": 0, "flex_lp": 0}
     
-    def get_champion_masteries(self, summoner_id: str, region: str = "euw") -> List[Dict]:
-        """Get summoner's champion masteries"""
+    def get_champion_masteries(self, puuid: str, region: str = "euw") -> List[Dict]:
+        """Get summoner's champion masteries using PUUID"""
         if not self.api_key:
             return []
         
         try:
-            url = f"{self.base_urls[region]}/lol/champion-mastery/v4/champion-masteries/by-summoner/{summoner_id}"
+            url = f"{self.base_urls[region]}/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}"
             response = self.session.get(url, timeout=10)
             
             if response.status_code == 200:
@@ -138,13 +178,19 @@ class RiotApiScraper:
             print(f"❌ Error getting champion masteries: {e}")
             return []
     
-    def get_match_history(self, puuid: str, region: str = "euw", count: int = 100) -> List[str]:
-        """Get summoner's match history"""
+    def get_match_history(self, puuid: str, region: str = "euw", count: int = 100, queue: int = None) -> List[str]:
+        """Get summoner's match history with support for large counts
+        
+        Args:
+            puuid: Player's PUUID
+            region: Region code
+            count: Number of matches to retrieve (can be > 100, will make multiple requests)
+            queue: Queue ID filter (None = all games, 420 = Ranked Solo/Duo, 0 = Custom)
+        """
         if not self.api_key:
             return []
         
         try:
-            # Use the regional routing value for match history
             routing_regions = {
                 'euw': 'europe',
                 'na': 'americas',
@@ -162,24 +208,58 @@ class RiotApiScraper:
             routing_region = routing_regions.get(region, 'europe')
             url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids"
             
-            params = {'count': count, 'queue': 420}  # 420 is Ranked Solo/Duo
-            response = self.session.get(url, params=params, timeout=10)
+            all_matches = []
+            remaining = count
+            start_index = 0
             
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return []
+            # Make multiple requests if count > 100
+            while remaining > 0 and len(all_matches) < count:
+                batch_size = min(100, remaining)
+                
+                params = {'count': batch_size, 'start': start_index}
+                if queue is not None:
+                    params['queue'] = queue
+                
+                response = self.session.get(url, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    batch = response.json()
+                    if not batch:  # No more games
+                        break
+                    all_matches.extend(batch)
+                    remaining -= len(batch)
+                    start_index += len(batch)
+                    
+                    # If requesting multiple batches, add tiny delay
+                    if remaining > 0 and len(batch) == batch_size:
+                        time.sleep(0.05)  # Tiny delay between batch requests
+                elif response.status_code == 429:
+                    # Rate limited
+                    retry_after = int(response.headers.get('Retry-After', 2))
+                    print(f"⚠️ Rate limited, waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue  # Retry same batch
+                else:
+                    break
+            
+            return all_matches[:count]  # Return exactly count requested
                 
         except Exception as e:
             print(f"❌ Error getting match history: {e}")
             return []
     
     def get_match_details(self, match_id: str, region: str = "euw") -> Optional[Dict]:
-        """Get detailed match information"""
+        """Get detailed match information with rate limiting"""
         if not self.api_key:
             return None
         
         try:
+            # Rate limiting: ensure minimum delay between requests
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            if time_since_last < self.request_delay:
+                time.sleep(self.request_delay - time_since_last)
+            
             routing_regions = {
                 'euw': 'europe',
                 'na': 'americas',
@@ -198,9 +278,22 @@ class RiotApiScraper:
             url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/{match_id}"
             
             response = self.session.get(url, timeout=10)
+            self.last_request_time = time.time()
             
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code == 429:
+                # Rate limited, wait and retry once
+                retry_after = min(int(response.headers.get('Retry-After', 1)), 3)  # Max 3 seconds
+                print(f"⚠️ Rate limited, waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                response = self.session.get(url, timeout=10)
+                self.last_request_time = time.time()
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    print(f"❌ Still rate limited after retry")
+                    return None
             else:
                 return None
                 
@@ -211,7 +304,6 @@ class RiotApiScraper:
     def get_champion_data(self) -> Dict[int, str]:
         """Get champion ID to name mapping from Data Dragon"""
         try:
-            # Get the latest version
             versions_url = "https://ddragon.leagueoflegends.com/api/versions.json"
             versions_response = requests.get(versions_url, timeout=10)
             
@@ -220,7 +312,6 @@ class RiotApiScraper:
             
             latest_version = versions_response.json()[0]
             
-            # Get champion data
             champions_url = f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/en_US/champion.json"
             champions_response = requests.get(champions_url, timeout=10)
             
@@ -239,37 +330,110 @@ class RiotApiScraper:
             print(f"❌ Error getting champion data: {e}")
             return {}
     
+    def get_tournament_matches(self, tournament_code: str, region: str = "euw") -> List[str]:
+        """Get match IDs from a tournament code"""
+        if not self.api_key:
+            print("❌ API key required for tournament code access")
+            return []
+        
+        try:
+            routing_regions = {
+                'euw': 'europe', 'na': 'americas', 'kr': 'asia',
+                'eune': 'europe', 'br': 'americas', 'jp': 'asia',
+                'ru': 'europe', 'oce': 'americas', 'tr': 'europe',
+                'lan': 'americas', 'las': 'americas'
+            }
+            
+            routing_region = routing_regions.get(region, 'europe')
+            url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/by-tournament-code/{tournament_code}/ids"
+            
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                print(f"❌ No matches found for tournament code: {tournament_code}")
+                return []
+            else:
+                print(f"❌ API error: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            print(f"❌ Error getting tournament matches: {e}")
+            return []
+    
+    def get_current_game(self, summoner_id: str, region: str = "euw") -> Optional[Dict]:
+        """Get current game information (spectator data)"""
+        if not self.api_key:
+            return None
+        
+        try:
+            url = f"{self.base_urls[region]}/lol/spectator/v5/active-games/by-summoner/{summoner_id}"
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                return None  # Not in game
+            else:
+                print(f"❌ API error: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error getting current game: {e}")
+            return None
+    
+    def get_match_timeline(self, match_id: str, region: str = "euw") -> Optional[Dict]:
+        """Get match timeline with detailed events"""
+        if not self.api_key:
+            return None
+        
+        try:
+            routing_regions = {
+                'euw': 'europe', 'na': 'americas', 'kr': 'asia',
+                'eune': 'europe', 'br': 'americas', 'jp': 'asia',
+                'ru': 'europe', 'oce': 'americas', 'tr': 'europe',
+                'lan': 'americas', 'las': 'americas'
+            }
+            
+            routing_region = routing_regions.get(region, 'europe')
+            url = f"https://{routing_region}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
+            
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error getting match timeline: {e}")
+            return None
+    
     def scrape_player_account(self, summoner_name: str, region: str = "euw") -> Optional[RiotPlayerAccount]:
         """Scrape comprehensive player account data using Riot API"""
-        print(f"🔍 Scraping account using Riot API: {summoner_name} ({region})")
         
         if not self.api_key:
             print("❌ Riot API key required. Please get one from https://developer.riotgames.com/")
             print("💡 You can still use the OP.GG scraper as a fallback")
             return None
         
-        # Get summoner information
         summoner_info = self.get_summoner_by_name(summoner_name, region)
         if not summoner_info:
             return None
         
         print(f"✅ Found summoner: {summoner_info['name']} (Level {summoner_info['summonerLevel']})")
         
-        # Get ranked information
-        ranked_info = self.get_summoner_ranked_info(summoner_info['id'], region)
+        ranked_info = self.get_summoner_ranked_info(summoner_info['puuid'], region)
         
-        # Get champion masteries
-        masteries = self.get_champion_masteries(summoner_info['id'], region)
+        masteries = self.get_champion_masteries(summoner_info['puuid'], region)
         print(f"📊 Found {len(masteries)} champion masteries")
         
-        # Get champion data mapping
         champion_mapping = self.get_champion_data()
         
-        # Get match history for detailed statistics
-        match_ids = self.get_match_history(summoner_info['puuid'], region, count=50)
+        match_ids = self.get_match_history(summoner_info['puuid'], region, count=50, queue=420)
         print(f"🎮 Found {len(match_ids)} recent matches")
         
-        # Process matches to get detailed champion statistics
         champion_stats = {}
         
         for i, match_id in enumerate(match_ids[:20]):  # Process first 20 matches
@@ -278,7 +442,6 @@ class RiotApiScraper:
                 if not match_details:
                     continue
                 
-                # Find the player in the match
                 participant_id = None
                 for participant in match_details['info']['participants']:
                     if participant['puuid'] == summoner_info['puuid']:
@@ -292,13 +455,11 @@ class RiotApiScraper:
                 champion_id = participant['championId']
                 champion_name = champion_mapping.get(champion_id, f"Champion_{champion_id}")
                 
-                # Initialize champion stats if not exists
                 if champion_name not in champion_stats:
                     champion_stats[champion_name] = {
                         'games': 0, 'wins': 0, 'kills': 0, 'deaths': 0, 'assists': 0, 'cs': 0, 'duration': 0
                     }
                 
-                # Update stats
                 champion_stats[champion_name]['games'] += 1
                 if participant['win']:
                     champion_stats[champion_name]['wins'] += 1
@@ -309,14 +470,11 @@ class RiotApiScraper:
                 champion_stats[champion_name]['cs'] += participant['totalMinionsKilled'] + participant['neutralMinionsKilled']
                 champion_stats[champion_name]['duration'] += match_details['info']['gameDuration']
                 
-                # Rate limiting
                 time.sleep(0.1)
                 
             except Exception as e:
-                print(f"⚠️ Error processing match {match_id}: {e}")
                 continue
         
-        # Convert to ChampionPerformance objects
         champion_performances = []
         for champion_name, stats in champion_stats.items():
             if stats['games'] > 0:
@@ -340,12 +498,11 @@ class RiotApiScraper:
                 )
                 champion_performances.append(performance)
         
-        # Sort by games played
         champion_performances.sort(key=lambda x: x.games_played, reverse=True)
         
         return RiotPlayerAccount(
             summoner_name=summoner_info['name'],
-            summoner_id=summoner_info['id'],
+            summoner_id=summoner_info['puuid'],  # Use PUUID as summoner_id (new API)
             puuid=summoner_info['puuid'],
             region=region,
             level=summoner_info['summonerLevel'],
@@ -361,7 +518,6 @@ def main():
     """Test the Riot API scraper"""
     print("🧪 Testing Riot API Scraper...")
     
-    # You need to get a Riot API key from https://developer.riotgames.com/
     api_key = None  # Replace with your actual API key
     
     scraper = RiotApiScraper(api_key)
@@ -371,7 +527,6 @@ def main():
         print("💡 The scraper will return None without an API key")
         return
     
-    # Test with your account
     result = scraper.scrape_player_account('Odd#kimmy', 'euw')
     
     if result:
@@ -388,7 +543,3 @@ def main():
             print(f"{i:2d}. {champ.champion_name:12s}: {champ.games_played:2d} games, {champ.win_rate:5.1f}% win rate, {champ.kda:4.2f} KDA")
     else:
         print("❌ Failed to get account data")
-
-if __name__ == "__main__":
-    main()
-

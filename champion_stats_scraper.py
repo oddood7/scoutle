@@ -28,15 +28,12 @@ class DetailedChampionStats:
     pick_rate: float
     ban_rate: float
     
-    # Items
     most_popular_items: List[str]
     highest_winrate_items: List[str]
     
-    # Matchups
     best_matchups: List[Matchup]
     worst_matchups: List[Matchup]
     
-    # Runes
     primary_rune: str = "Unknown"
     secondary_rune: str = "Unknown"
     
@@ -48,18 +45,22 @@ class ChampionStatsScraper:
     
     def __init__(self):
         self.session = requests.Session()
-        self.ua = UserAgent()
+        try:
+            self.ua = UserAgent()
+        except Exception as e:
+            print("   Using fallback user agent string")
+            self.ua = type('MockUserAgent', (), {
+                'random': lambda: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            })()
         self.session.headers.update({
             'User-Agent': self.ua.random,
             'Accept': 'text/html,application/xhtml+xml,application/xml',
             'Accept-Language': 'en-US,en;q=0.9',
         })
-        # Champion icon URLs (Data Dragon CDN - no auth needed)
         self.icon_base_url = "https://ddragon.leagueoflegends.com/cdn/15.1.1/img/champion"
     
     def get_champion_icon_url(self, champion_name: str) -> Optional[str]:
         """Get champion icon URL from Data Dragon (no auth needed)"""
-        # Simple name mapping for common champions
         name_map = {
             "aurelionsol": "AurelionSol", "belveth": "Belveth", "chogath": "Chogath",
             "drmundo": "DrMundo", "jarvaniv": "JarvanIV", "kogmaw": "KogMaw",
@@ -76,13 +77,9 @@ class ChampionStatsScraper:
     
     def get_champion_stats(self, champion_name: str, role: str = "default") -> Optional[DetailedChampionStats]:
         """Get comprehensive champion statistics"""
-        print(f"🔍 Fetching stats for {champion_name}")
         
         try:
-            # Use Lolalytics for reliable data - Diamond+ only, current patch only
             clean_name = champion_name.lower().replace(" ", "").replace("'", "")
-            # tier=diamond_plus for Diamond+ ONLY
-            # No patch parameter = current patch only (not last 30 days!)
             url = f"https://lolalytics.com/lol/{clean_name}/build/?tier=diamond_plus"
             
             print(f"   📡 Lolalytics (Diamond+, Current Patch): {url}")
@@ -95,16 +92,11 @@ class ChampionStatsScraper:
             soup = BeautifulSoup(response.content, 'html.parser')
             page_text = soup.get_text()
             
-            # Debug: save the page to check content
-            # with open(f'debug_{clean_name}_scraper.html', 'w', encoding='utf-8') as f:
-            #     f.write(response.text)
             
-            # Extract from Lolalytics page text
             win_rate, pick_rate, ban_rate = self._extract_rates_from_lolalytics(page_text)
             tier = self._extract_tier_from_lolalytics(page_text)
             detected_role = self._detect_role(page_text, champion_name)
             
-            # Extract items, matchups, runes from page
             popular_items, winrate_items = self._extract_items_from_lolalytics(soup, page_text)
             best_matchups, worst_matchups = self._extract_matchups_from_lolalytics(soup, page_text, champion_name)
             primary_rune, secondary_rune = self._extract_runes_from_lolalytics(soup, page_text)
@@ -141,29 +133,24 @@ class ChampionStatsScraper:
         pick_rate = 5.0
         ban_rate = 5.0
         
-        # EXACT pattern from Lolalytics summary: "Zeri bottom has a 51.83% win rate"
-        # This is the first mention and most accurate
         summary_pattern = r'has a (\d+\.\d+)% win rate in Diamond\+'
         match = re.search(summary_pattern, text)
         if match:
             win_rate = float(match.group(1))
             print(f"      Win Rate: {win_rate}%")
         else:
-            # Fallback without Diamond+ requirement
             summary_pattern2 = r'has a (\d+\.\d+)% win rate'
             match = re.search(summary_pattern2, text)
             if match:
                 win_rate = float(match.group(1))
                 print(f"      Win Rate: {win_rate}%")
         
-        # Pick rate: "3.45% Pick Rate"
         pick_pattern = r'(\d+\.\d+)%\s*Pick Rate'
         match = re.search(pick_pattern, text)
         if match:
             pick_rate = float(match.group(1))
             print(f"      Pick Rate: {pick_rate}%")
         
-        # Ban rate: "0.32% Ban Rate"
         ban_pattern = r'(\d+\.\d+)%\s*Ban Rate'
         match = re.search(ban_pattern, text)
         if match:
@@ -174,7 +161,6 @@ class ChampionStatsScraper:
     
     def _detect_role(self, text: str, champion_name: str) -> str:
         """Detect primary role from Lolalytics"""
-        # Look for role in title: "Zeri Build, Runes & Counters for bottom Zeri"
         role_pattern = r'for (top|jungle|middle|bottom|support) ' + re.escape(champion_name.lower())
         match = re.search(role_pattern, text, re.IGNORECASE)
         
@@ -187,7 +173,6 @@ class ChampionStatsScraper:
     
     def _extract_tier_from_lolalytics(self, text: str) -> str:
         """Extract tier from Lolalytics page"""
-        # Look for tier in the summary: "graded A+ Tier"
         tier_pattern = r'graded ([SABCD][\+\-]?) Tier'
         match = re.search(tier_pattern, text)
         
@@ -196,7 +181,6 @@ class ChampionStatsScraper:
             print(f"      Tier: {tier}")
             return tier
         
-        # Fallback to calculation
         return "B"
     
     def _calculate_tier(self, win_rate: float, pick_rate: float) -> str:
@@ -215,10 +199,8 @@ class ChampionStatsScraper:
     def _extract_items_from_lolalytics(self, soup: BeautifulSoup, text: str) -> Tuple[List[str], List[str]]:
         """Extract the actual 3-item build sets from Core Build section"""
         
-        # Find Core Build section first
         core_idx = text.find('Core Build')
         
-        # Get all item images, filtering properly
         all_items = []
         seen = set()
         item_imgs = soup.find_all('img', limit=500)
@@ -227,21 +209,15 @@ class ChampionStatsScraper:
             src = img.get('src', '')
             alt = img.get('alt', '')
             
-            # Only actual items (not skills, runes, etc.)
             if '/item64/' in src or '/item32/' in src:
                 if alt and len(alt) > 2 and alt not in seen:
-                    # Skip consumables and starter items
                     skip = ["Doran", "Health Potion", "Mana Potion", "Refillable", 
                            "Stealth Ward", "Oracle", "Control Ward", "Farsight", "Boots of Speed"]
                     if not any(s in alt for s in skip):
                         all_items.append(alt)
                         seen.add(alt)
         
-        # From the page structure:
-        # Core Build = first 3 items (this is the highest WR build)
-        # The page shows these in order they're most effective
         
-        # Get first 3 unique REAL items for Highest WR build
         highest_wr_build = []
         most_popular_build = []
         
@@ -253,7 +229,6 @@ class ChampionStatsScraper:
             if len(highest_wr_build) >= 3 and len(most_popular_build) >= 3:
                 break
         
-        # If not enough items found, use defaults
         if len(highest_wr_build) < 3:
             highest_wr_build = ["Runaan's Hurricane", "Berserker's Greaves", "Infinity Edge"]
         if len(most_popular_build) < 3:
@@ -262,7 +237,6 @@ class ChampionStatsScraper:
         print(f"      📦 Build #1 (Highest WR): {', '.join(highest_wr_build)}")
         print(f"      📦 Build #2 (Most Popular): {', '.join(most_popular_build)}")
         
-        # Return: (popular, winrate)
         return most_popular_build, highest_wr_build
     
     def _extract_matchups_from_lolalytics(self, soup: BeautifulSoup, text: str, champion_name: str) -> Tuple[List[Matchup], List[Matchup]]:
@@ -271,12 +245,10 @@ class ChampionStatsScraper:
         best_matchups = []
         worst_matchups = []
         
-        # Look for the summary text: "strong counter to X, Y & Z while ... is countered most by A, B & C"
         matchup_pattern = r'strong counter to ([^<]+?) while .+ countered most by ([^<]+?)\.'
         match = re.search(matchup_pattern, text)
         
         if match:
-            # Parse strong against (best matchups) - varied WR 54-58%, games 180-420
             strong_text = match.group(1)
             strong_champions = re.split(r',\s*|\s*&\s*', strong_text)
             wr_values = [56.8, 55.2, 54.5]  # Realistic spread
@@ -287,7 +259,6 @@ class ChampionStatsScraper:
                 if champ and len(champ) > 1:
                     best_matchups.append(Matchup(champ, wr_values[i], games_values[i]))
             
-            # Parse weak against (worst matchups) - varied WR 40-46%, games 150-380
             weak_text = match.group(2)
             weak_champions = re.split(r',\s*|\s*&\s*', weak_text)
             wr_values_weak = [43.2, 44.8, 45.9]  # Realistic spread
@@ -298,7 +269,6 @@ class ChampionStatsScraper:
                 if champ and len(champ) > 1:
                     worst_matchups.append(Matchup(champ, wr_values_weak[i], games_values_weak[i]))
         
-        # Print what we found
         if best_matchups:
             matchups_str = ', '.join([f'{m.opponent_name} ({m.win_rate:.1f}%)' for m in best_matchups])
             print(f"      ✅ Easy lanes: {matchups_str}")
@@ -313,7 +283,6 @@ class ChampionStatsScraper:
         primary = "Unknown"
         secondary = "Unknown"
         
-        # Look for rune images - the active one doesn't have "grayscale" class
         rune_imgs = soup.find_all('img', {'src': re.compile(r'rune\d+/', re.I)})
         
         keystones = [
@@ -326,20 +295,16 @@ class ChampionStatsScraper:
         
         trees = ["Precision", "Domination", "Sorcery", "Resolve", "Inspiration"]
         
-        # Find the active keystone (doesn't have grayscale in class)
         for img in rune_imgs[:15]:  # Check first 15 rune images
             alt = img.get('alt', '')
             img_class = img.get('class', [])
             
-            # Convert class to string if it's a list
             class_str = ' '.join(img_class) if isinstance(img_class, list) else str(img_class)
             
-            # Active rune doesn't have grayscale
             if alt in keystones and 'grayscale' not in class_str:
                 primary = alt
                 break
         
-        # Determine primary tree from keystone
         rune_to_tree = {
             "Lethal Tempo": "Precision", "Fleet Footwork": "Precision", 
             "Press the Attack": "Precision", "Conqueror": "Precision",
@@ -351,14 +316,10 @@ class ChampionStatsScraper:
         
         primary_tree = rune_to_tree.get(primary, "Unknown")
         
-        # Look for secondary tree - must be different from primary
-        # Scan more rune images after finding primary for secondary tree runes
         secondary_rune_found = False
         for i, img in enumerate(rune_imgs[5:25]):  # Skip first few, check next 20
             src = img.get('src', '')
             
-            # Extract tree from rune ID pattern: rune68/8XXX where first digit = tree
-            # 80XX = Precision, 81XX = Domination, 82XX = Sorcery, 83XX = Inspiration, 84XX = Resolve
             rune_id_match = re.search(r'/rune\d+/(\d{4})', src)
             if rune_id_match:
                 rune_id = int(rune_id_match.group(1))
@@ -385,7 +346,6 @@ class ChampionStatsScraper:
         if not stats1 or not stats2:
             return None
         
-        # Find matchup
         matchup_wr = None
         champ2_lower = champ2.lower()
         
@@ -422,27 +382,3 @@ class ChampionStatsScraper:
             return "Difficult"
         else:
             return "Very Hard"
-
-# Test
-if __name__ == "__main__":
-    scraper = ChampionStatsScraper()
-    
-    print("Testing Zeri...")
-    stats = scraper.get_champion_stats("Zeri")
-    if stats:
-        print(f"\n✅ {stats.champion_name} ({stats.role})")
-        print(f"Tier: {stats.tier} | WR: {stats.win_rate:.1f}% | PR: {stats.pick_rate:.1f}%")
-        print(f"Popular Items: {', '.join(stats.most_popular_items)}")
-        print(f"Best Matchups:")
-        for m in stats.best_matchups:
-            print(f"  • {m.opponent_name}: {m.win_rate:.1f}% WR")
-        print(f"Worst Matchups:")
-        for m in stats.worst_matchups:
-            print(f"  • {m.opponent_name}: {m.win_rate:.1f}% WR")
-        print(f"Runes: {stats.primary_rune} / {stats.secondary_rune}")
-    
-    print("\n" + "=" * 60)
-    comparison = scraper.compare_champions("Zeri", "Jinx")
-    if comparison:
-        print(f"✅ {comparison['champion1'].champion_name} vs {comparison['champion2'].champion_name}")
-        print(f"Matchup WR: {comparison['matchup_winrate']:.1f}% ({comparison['difficulty']})")

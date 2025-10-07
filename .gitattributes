@@ -1,0 +1,25 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python files
+*.py text eol=lf
+*.pyi text eol=lf
+
+# Markdown files
+*.md text eol=lf
+
+# JSON files
+*.json text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Text files
+*.txt text eol=lf
+
+# Exclude data files from export
+manual_matches.json export-ignore
+team_data.json export-ignore
+config.json export-ignore
+.env export-ignore
+

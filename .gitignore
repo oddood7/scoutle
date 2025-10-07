@@ -121,4 +121,11 @@ temp/
 tmp/
 config.json
 manual_matches.json
+team_data.json
 debug*.html
+*.pyc
+.env.local
+
+# Documentation (exclude from GitHub)
+*.md
+README.md
